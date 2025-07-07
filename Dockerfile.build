@@ -4,8 +4,8 @@ WORKDIR /app
 
 RUN apk add --no-cache python3 make g++ bash py3-setuptools git rsync postgresql-client
 
-ARG USERNAME=preet665
-ARG REPO_NAME=plasmic-coolify
+ARG USERNAME=AiheApp
+ARG REPO_NAME=aihe-plasmic-coolify
 ARG GIT_BRANCH=master
 
 ARG DB_HOST_ARG=db
