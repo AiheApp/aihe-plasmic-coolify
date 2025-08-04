@@ -1,0 +1,171 @@
+services:
+  # System Initialization - Runs once to set up swap and optimize system
+  system-init:
+    image: alpine:latest
+    privileged: true
+    volumes:
+      - /:/host
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: |
+      sh -c "
+        echo '🔧 Initializing system for Plasmic deployment...'
+        
+        # Create 8GB swap file if it doesn't exist
+        if [ ! -f /host/swapfile ]; then
+          echo '📁 Creating 8GB swap space...'
+          fallocate -l 8G /host/swapfile 2>/dev/null || dd if=/dev/zero of=/host/swapfile bs=1M count=8192
+          chmod 600 /host/swapfile
+          mkswap /host/swapfile
+          swapon /host/swapfile
+          echo '/swapfile none swap sw 0 0' >> /host/etc/fstab
+          echo '✅ Swap space created and activated'
+        else
+          echo '✅ Swap space already exists'
+          swapon /host/swapfile 2>/dev/null || echo 'Swap already active'
+        fi
+        
+        # Optimize memory settings
+        echo '⚙️ Optimizing kernel parameters...'
+        echo 'vm.swappiness=10' >> /host/etc/sysctl.conf
+        echo 'vm.vfs_cache_pressure=50' >> /host/etc/sysctl.conf  
+        echo 'vm.dirty_ratio=15' >> /host/etc/sysctl.conf
+        echo 'vm.dirty_background_ratio=5' >> /host/etc/sysctl.conf
+        
+        # Apply settings
+        chroot /host sysctl -p 2>/dev/null || echo 'Sysctl settings queued for next boot'
+        
+        # Create application directories
+        mkdir -p /host/opt/plasmic/logs
+        
+        echo '🎉 System initialization complete!'
+        echo '📊 Memory info:'
+        free -h
+        echo '💾 Disk info:'
+        df -h /host
+        
+        # Keep container running for a bit to ensure initialization completes
+        sleep 30
+      "
+    restart: "no"
+    deploy:
+      resources:
+        limits:
+          memory: 100M
+          cpus: '0.1'
+
+  # Database Service - Optimized for 16GB VM
+  db:
+    image: postgres:15-alpine
+    restart: always
+    depends_on:
+      system-init:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_USER: wab
+      POSTGRES_PASSWORD: plasmic
+      POSTGRES_DB: wab
+      # Memory optimizations for 16GB VM
+      POSTGRES_SHARED_BUFFERS: 256MB
+      POSTGRES_EFFECTIVE_CACHE_SIZE: 2GB
+      POSTGRES_MAX_CONNECTIONS: 50
+      POSTGRES_WORK_MEM: 8MB
+      POSTGRES_MAINTENANCE_WORK_MEM: 128MB
+      POSTGRES_CHECKPOINT_COMPLETION_TARGET: 0.9
+      POSTGRES_WAL_BUFFERS: 16MB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wab -d wab"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - plasmic-net
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1.0'
+        reservations:
+          memory: 1G
+          cpus: '0.5'
+
+  # Plasmic Application - Build from source (no external images)
+  plasmic-app:
+    build:
+      context: .
+      dockerfile: Dockerfile.ci
+      args:
+        USERNAME: AiheApp
+        REPO_NAME: aihe-plasmic-coolify
+        GIT_BRANCH: master
+        DB_HOST_ARG: db
+        DB_USER_ARG: wab
+        DB_PASSWORD_ARG: plasmic
+        DB_NAME_ARG: wab
+        DB_PORT_ARG: 5432
+    restart: always
+    depends_on:
+      system-init:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      # Memory optimization - 3GB heap instead of default 16GB
+      NODE_OPTIONS: "--max-old-space-size=3072 --max-semi-space-size=256 --optimize-for-size"
+      
+      # Database configuration
+      PGHOST: db
+      PGPORT: 5432
+      PGUSER: wab
+      PGPASSWORD: plasmic
+      PGDATABASE: wab
+      WAB_DBNAME: wab
+      WAB_PASSWORD: plasmic
+      
+      # Application configuration  
+      SESSION_SECRET: "change-this-in-production-to-a-secure-random-string"
+      
+      # Performance optimizations
+      UV_THREADPOOL_SIZE: 128
+      NODE_OPTIONS_MAX_OLD_SPACE_SIZE: 3072
+      
+    volumes:
+      - app_logs:/app/logs
+      - /opt/plasmic/logs:/app/logs/host
+    networks:
+      - plasmic-net
+    deploy:
+      resources:
+        limits:
+          memory: 12G  # Most of the 16GB VM memory
+          cpus: '6.0'
+        reservations:
+          memory: 6G
+          cpus: '3.0'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3003/api/health", "||", "exit", "1"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 300s  # Allow extra time for build + startup
+    
+    # Coolify labels for automatic domain and SSL management
+    labels:
+      - "coolify.managed=true"
+      - "coolify.type=application"
+      - "coolify.name=plasmic-app"
+
+# Networks
+networks:
+  plasmic-net:
+    driver: bridge
+
+# Volumes
+volumes:
+  postgres_data:
+    driver: local
+  app_logs:
+    driver: local
